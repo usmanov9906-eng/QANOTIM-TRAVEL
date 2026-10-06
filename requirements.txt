@@ -1,0 +1,5 @@
+aiogram>=3.13
+anthropic>=0.40
+httpx>=0.27
+beautifulsoup4>=4.12
+psycopg[binary]>=3.2
