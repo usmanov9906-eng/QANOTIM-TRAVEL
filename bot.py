@@ -109,60 +109,72 @@ def fetch_source():
     return posts
 
 
-_gem_model = GEMINI_MODEL
 GEM_BASE = "https://generativelanguage.googleapis.com/v1beta"
+_gem_models: list = []   # kalitingizga ochiq mos modellar (tartib bilan)
+_gem_ok = None           # oxirgi ishlagan model
 
 
-async def gemini_pick_model(c, exclude=()):
-    """Kalitingiz uchun mavjud modellar ichidan mosini tanlaydi."""
-    global _gem_model
+async def gemini_models(c):
+    """Kalitingizga ochiq modellar ichidan mosini tanlab, zaxira ro'yxat tuzadi."""
+    global _gem_models
+    if _gem_models:
+        return _gem_models
     r = await c.get(f"{GEM_BASE}/models?pageSize=200",
                     headers={"x-goog-api-key": GEMINI_API_KEY})
     r.raise_for_status()
     names = [m["name"].split("/", 1)[1] for m in r.json().get("models", [])
              if "generateContent" in m.get("supportedGenerationMethods", [])]
-    log.info("Gemini modellari: %s", names)
     prefer = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-flash-lite-latest",
               "gemini-2.5-flash-lite", "gemini-2.0-flash"]
-    for p in prefer:
-        if p in names and p not in exclude:
-            _gem_model = p
-            log.info("Tanlangan Gemini modeli: %s", p)
-            return
+    chosen = [p for p in prefer if p in names]
     bad = ("image", "tts", "live", "audio", "exp", "thinking", "embedding", "robotics")
-    flash = [n for n in names if "flash" in n and n not in exclude
+    extra = [n for n in names if "flash" in n and n not in chosen
              and not any(x in n for x in bad)]
-    if not flash:
-        raise RuntimeError("Mos Gemini modeli topilmadi")
-    _gem_model = flash[0]
-    log.info("Tanlangan Gemini modeli: %s", _gem_model)
+    models = ([GEMINI_MODEL] if GEMINI_MODEL else []) + chosen + extra
+    _gem_models = models[:5]
+    log.info("Gemini zaxira modellari: %s", _gem_models)
+    return _gem_models
 
 
 async def translate(text: str) -> str:
-    global _gem_model
+    global _gem_ok
     if GEMINI_API_KEY:
         body = {
             "systemInstruction": {"parts": [{"text": SYSTEM}]},
             "contents": [{"role": "user", "parts": [{"text": text}]}],
             "generationConfig": {"temperature": 0.3},
         }
+        errors = []
         async with httpx.AsyncClient(timeout=90) as c:
-            if not _gem_model:
-                await gemini_pick_model(c)
-            r = None
-            for attempt in (1, 2):
-                r = await c.post(f"{GEM_BASE}/models/{_gem_model}:generateContent",
-                                 json=body,
-                                 headers={"x-goog-api-key": GEMINI_API_KEY})
-                if r.status_code == 404 and attempt == 1:
-                    failed = _gem_model
-                    await gemini_pick_model(c, exclude=(failed,))
-                    continue
-                break
-            r.raise_for_status()
-            data = r.json()
-        parts = data["candidates"][0]["content"]["parts"]
-        return "".join(p.get("text", "") for p in parts).strip()
+            models = list(await gemini_models(c))
+            if _gem_ok in models:                      # oxirgi ishlagani birinchi
+                models.remove(_gem_ok)
+                models.insert(0, _gem_ok)
+            for model in models:
+                r = None
+                for attempt in (1, 2):
+                    r = await c.post(f"{GEM_BASE}/models/{model}:generateContent",
+                                     json=body,
+                                     headers={"x-goog-api-key": GEMINI_API_KEY})
+                    if r.status_code in (429, 503) and attempt == 1:
+                        await asyncio.sleep(8)         # band bo'lsa biroz kutib qayta uriniladi
+                        continue
+                    break
+                if r.status_code == 200:
+                    try:
+                        parts = r.json()["candidates"][0]["content"]["parts"]
+                        out = "".join(p.get("text", "") for p in parts).strip()
+                        if out:
+                            if _gem_ok != model:
+                                log.info("Ishlayotgan Gemini modeli: %s", model)
+                            _gem_ok = model
+                            return out
+                    except (KeyError, IndexError):
+                        pass
+                    errors.append(f"{model}: bo'sh javob")
+                else:
+                    errors.append(f"{model}: {r.status_code}")
+        raise RuntimeError("Gemini ishlamadi -> " + "; ".join(errors))
     if claude:
         r = await claude.messages.create(
             model=MODEL, max_tokens=1500, system=SYSTEM,
